@@ -264,6 +264,7 @@ class OpenStackInterface:
 
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def get_floating_ips(self):
         """_summary_
 
