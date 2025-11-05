@@ -14,6 +14,7 @@ from pprint import pprint
 # OpenStack Nova and Glance API Version and Credentials
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# TODO: clean up the definitions below - some are not used - maybe use a dataclass?
 NOVA_API_VERSION = "2.0"
 
 OS_USERNAME = 'OS_USERNAME'
@@ -45,7 +46,18 @@ NOVA_CREDS_KEYS = [
 
 class OpenStackInterface:
 
-    def __init__(self):
+    def __init__(self,
+                 vm_setup_script_path : str,
+                 gpu_setup_script_path : str,
+                 monitor_setup_script_path : str):
+
+        # TODO: add error checking for the script paths
+        # paths to the setup scripts to be copied to the VMs
+        self.vm_setup_script_path = vm_setup_script_path
+        self.gpu_setup_script_path = gpu_setup_script_path
+        self.monitor_setup_script_path = monitor_setup_script_path
+
+        # initialize the OpenStack clients
         self.nova = None
         self._init_nova_client()
 
@@ -151,6 +163,7 @@ class OpenStackInterface:
         sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
 
         self.nova = novaclient.Client(NOVA_API_VERSION, **creds, cacert=os.environ['OS_CACERT'])
+        self.neutron = neutronclient.Client(session=sess)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -283,6 +296,25 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def release_floating_ip(self,
+                            vm_hostname : str,
+                            floating_ip_address : str):
+
+        # self._switch_project('admin')
+
+        try:
+        #    self.neutron.delete_floatingip(floating_ip_address)
+            for fip in self.neutron.list_floatingips()['floatingips']:
+                if fip['floating_ip_address'] == floating_ip_address:
+                    self.neutron.update_floatingip(fip['id'], {'floatingip': {'port_id': None}})
+                    self.neutron.delete_floatingip(fip['id'])
+                    return True
+
+        except Exception as e:
+            raise e
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def create_vm(self,
                   project_name : str,
                   hostname : str,
@@ -292,12 +324,11 @@ class OpenStackInterface:
 
         self._switch_project(project_name)
 
-        #  Prepare user data for the VM (this is the initial setup script)
-        # TODO: remove this hard coding
-        script_file_path = '/home/sysadmin/setup-script.sh'
+        # TODO: check to see if there are any floating IPs available in the project
 
+        # TODO: this needs to be loaded only once
         # Read the script file and use it as user_data
-        with open(script_file_path, 'r') as f:
+        with open(self.vm_setup_script_path, 'r') as f:
             user_data = f.read()
 
         # create the VM using the Nova client
@@ -311,11 +342,43 @@ class OpenStackInterface:
         except Exception as e:
             raise ValueError(f"Failed to create VM: {e}")
 
+        # TODO: instead of hard coding the network ID, we should get it from the Neutron client
         # Associate a floating IP to the VM
-        # self.assosciate_floating_ip(vm, networks[0]['net-id'])
-        floating_ip =self.assosciate_floating_ip(vm, 'bb005c60-fb45-481a-97fb-f746033e1c5d')
+        floating_ip = self.assosciate_floating_ip(vm, 'bb005c60-fb45-481a-97fb-f746033e1c5d')
+
+        # TODO: run the 'final.sh' script on the VM to complete the setup
+
+        # TODO: Check if the VM has a GPU and if so run the GPU setup script on the VM
 
         return vm, floating_ip
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _get_server_by_name(self,
+                            vm_hostname : str):
+
+        servers = self.nova.servers.list(search_opts={'all_tenants': True})
+
+        vms = [s for s in servers if s.name == vm_hostname]
+
+        if len(vms) == 0:
+            raise ValueError(f"VM {vm_hostname} not found")
+        elif len(vms) > 1:
+            raise ValueError(f"Multiple VMs with the name {vm_hostname} found")
+        else:
+            return vms[0]
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def delete_vm(self,
+                  vm_hostname : str):
+        try:
+            vm = self._get_server_by_name(vm_hostname)
+            self.nova.servers.delete(vm.id)
+            return True
+        except Exception as e:
+            raise ValueError(f"Failed to delete VM {vm_hostname}: {e}")
+
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
