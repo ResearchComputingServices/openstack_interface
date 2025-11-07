@@ -7,6 +7,7 @@ from glanceclient import client as glanceclient
 from keystoneauth1 import loading
 from keystoneauth1 import session as keystone_session
 from keystoneclient.v3 import client as keystone_client
+from openstack_placement import client as placement_client
 
 from pprint import pprint
 
@@ -70,6 +71,9 @@ class OpenStackInterface:
         self.keystone = None
         self._init_keystone_client()
 
+        self.placement = None
+        self._init_placement_client()
+
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def _get_creds(self):
@@ -84,6 +88,27 @@ class OpenStackInterface:
                 raise ValueError(f"Environment variable {env_var} is not set. Please set it before running the script.")
 
         return d
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _set_project_name(self, project_name: str):
+
+        os.environ[OS_PROJECT_NAME] = project_name
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _init_placement_client(self):
+        """
+        Initialize the Placement client with the credentials.
+        """
+        creds = self._get_creds()
+
+        loader = loading.get_plugin_loader('password')
+        auth = loader.load_from_options(**creds)
+
+        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
+
+        self.placement = placement_client.Client(session=sess)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -153,9 +178,9 @@ class OpenStackInterface:
         """
         Switch the Nova client to a different project.
         """
-        creds = self._get_creds()
-        creds['project_name'] = project_name
+        self._set_project_name(project_name)
 
+        creds = self._get_creds()
         loader = loading.get_plugin_loader('password')
         auth = loader.load_from_options(**creds)
 
@@ -324,6 +349,8 @@ class OpenStackInterface:
 
         self._switch_project(project_name)
 
+        print(f"{self._get_creds()}")
+
         # TODO: check to see if there are any floating IPs available in the project
 
         # TODO: this needs to be loaded only once
@@ -339,8 +366,13 @@ class OpenStackInterface:
                                             key_name='newmaster',
                                             nics=networks,
                                             userdata=user_data)
+
+        except novaclient.exceptions.Forbidden as e:
+            raise ValueError(f"Permission denied to create VM in project '{self._get_creds()}': {e}")
+
         except Exception as e:
-            raise ValueError(f"Failed to create VM: {e}")
+            raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
+
 
         # TODO: instead of hard coding the network ID, we should get it from the Neutron client
         # Associate a floating IP to the VM
@@ -413,3 +445,24 @@ class OpenStackInterface:
         return self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def resources_available(self,
+                            vcpus : int,
+                            ram_mb : int,
+                            disk_gb : int) -> bool:
+        """
+        Check if the requested resources are available in the OpenStack cluster.
+
+        Args:
+            vcpus (int): Number of virtual CPUs requested.
+            ram_mb (int): Amount of RAM in MB requested.
+            disk_gb (int): Amount of disk space in GB requested.
+
+        Returns:
+            bool: True if resources are available, False otherwise.
+        """
+
+        available_resources = self.placement.get_allocated_resources()
+        return (available_resources['vcpus'] >= vcpus and
+                available_resources['ram_mb'] >= ram_mb and
+                available_resources['disk_gb'] >= disk_gb)
