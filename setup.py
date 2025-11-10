@@ -6,10 +6,7 @@ setup(
 
     packages=find_packages(),
     python_requires='>=3.7',
-    install_requires=[  "python-glanceclient==4.9.0",
-                        "python-keystoneclient==5.6.0",
-                        "python-neutronclient==11.6.0",
-                        "python-novaclient==18.10.0",
+    install_requires=[  "openstacksdk>=1.0.0",
                         "pytest",],
     extras_require={'dev': ['pytest']},
 

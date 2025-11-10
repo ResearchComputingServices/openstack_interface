@@ -1,48 +1,11 @@
 import os
 import time
-
-from novaclient import client as novaclient
-from neutronclient.v2_0 import client as neutronclient
-from glanceclient import client as glanceclient
-from keystoneauth1 import loading
-from keystoneauth1 import session as keystone_session
-from keystoneclient.v3 import client as keystone_client
-from openstack_placement import client as placement_client
-
+import openstack
+from openstack.config import loader
 from pprint import pprint
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# OpenStack Nova and Glance API Version and Credentials
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# TODO: clean up the definitions below - some are not used - maybe use a dataclass?
-NOVA_API_VERSION = "2.0"
-
-OS_USERNAME = 'OS_USERNAME'
-OS_PASSWORD = 'OS_PASSWORD'
-OS_AUTH_URL = 'OS_AUTH_URL'
-OS_PROJECT_NAME = 'OS_PROJECT_NAME'
-OS_PROJECT_DOMAIN_NAME = 'OS_PROJECT_DOMAIN_NAME'
-OS_USER_DOMAIN_NAME = 'OS_USER_DOMAIN_NAME'
-OS_CACERT = 'OS_CACERT'
-
-NOVA_CREDS_ENV_VARS = [ OS_USERNAME,
-                        OS_PASSWORD,
-                        OS_AUTH_URL,
-                        OS_PROJECT_NAME,
-                        OS_PROJECT_DOMAIN_NAME,
-                        OS_USER_DOMAIN_NAME,
-                        OS_CACERT]
-
-NOVA_CREDS_KEYS = [
-    'username',
-    'password',
-    'auth_url',
-    'project_name',
-    'project_domain_name',
-    'user_domain_name',
-]
-
+# OpenStack SDK Configuration
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 class OpenStackInterface:
@@ -58,157 +21,75 @@ class OpenStackInterface:
         self.gpu_setup_script_path = gpu_setup_script_path
         self.monitor_setup_script_path = monitor_setup_script_path
 
-        # initialize the OpenStack clients
-        self.nova = None
-        self._init_nova_client()
-
-        self.glance = None
-        self._init_glance_client()
-
-        self.neutron = None
-        self._init_neutron_client()
-
-        self.keystone = None
-        self._init_keystone_client()
-
-        self.placement = None
-        self._init_placement_client()
+        # Initialize the OpenStack SDK connection
+        self.conn = self._init_connection()
+        self.current_project = None
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _get_creds(self):
+    def _init_connection(self):
+        """
+        Initialize the OpenStack SDK connection using environment variables.
+        """
+        # Verify required environment variables are set
+        required_vars = [
+            'OS_USERNAME', 'OS_PASSWORD', 'OS_AUTH_URL', 'OS_PROJECT_NAME',
+            'OS_PROJECT_DOMAIN_NAME', 'OS_USER_DOMAIN_NAME'
+        ]
 
-        d = {}
+        for var in required_vars:
+            if not os.environ.get(var):
+                raise ValueError(f"Environment variable {var} is not set. Please set it before running the script.")
 
-        for env_var, key in zip(NOVA_CREDS_ENV_VARS, NOVA_CREDS_KEYS):
-            value = os.environ.get(env_var, None)
-            if value is not None:
-                d[key] = value
-            else:
-                raise ValueError(f"Environment variable {env_var} is not set. Please set it before running the script.")
+        # Create connection using environment variables
+        conn = openstack.connect(
+            auth_url=os.environ['OS_AUTH_URL'],
+            project_name=os.environ['OS_PROJECT_NAME'],
+            username=os.environ['OS_USERNAME'],
+            password=os.environ['OS_PASSWORD'],
+            project_domain_name=os.environ['OS_PROJECT_DOMAIN_NAME'],
+            user_domain_name=os.environ['OS_USER_DOMAIN_NAME'],
+            verify=os.environ.get('OS_CACERT', True)
+        )
 
-        return d
+        return conn
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _set_project_name(self, project_name: str):
-
-        os.environ[OS_PROJECT_NAME] = project_name
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_placement_client(self):
-        """
-        Initialize the Placement client with the credentials.
-        """
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.placement = placement_client.Client(session=sess)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_neutron_client(self):
-        """
-        Initialize the Neutron client with the credentials.
-        """
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.neutron = neutronclient.Client(session=sess)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_nova_client(self):
-        """
-        Initialize the Nova client with the credentials.
-        """
-
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        # TODO: I think we should be able to get rid of this?
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.nova = novaclient.Client(NOVA_API_VERSION, **creds, cacert=os.environ['OS_CACERT'])
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_glance_client(self):
-        """
-        Initialize the Glance client with the credentials.
-        """
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.glance = glanceclient.Client("2", session=sess)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_keystone_client(self):
-        """
-        Initialize the Keystone client with the credentials.
-        """
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.keystone = keystone_client.Client(session=sess)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def _switch_project(self, project_name: str):
         """
-        Switch the Nova client to a different project.
+        Switch to a different project by creating a new connection.
         """
-        self._set_project_name(project_name)
-
-        creds = self._get_creds()
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        # TODO: I think we should be able to get rid of this?
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.nova = novaclient.Client(NOVA_API_VERSION, **creds, cacert=os.environ['OS_CACERT'])
-        self.neutron = neutronclient.Client(session=sess)
+        self.conn = openstack.connect(
+            auth_url=os.environ['OS_AUTH_URL'],
+            project_name=project_name,
+            username=os.environ['OS_USERNAME'],
+            password=os.environ['OS_PASSWORD'],
+            project_domain_name=os.environ['OS_PROJECT_DOMAIN_NAME'],
+            user_domain_name=os.environ['OS_USER_DOMAIN_NAME'],
+            verify=os.environ.get('OS_CACERT', True)
+        )
+        self.current_project = project_name
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_projects(self):
         """
-        Get the list of projects from the Keystone client.
+        Get the list of projects from OpenStack.
         """
-        return self.keystone.projects.list()
+        return list(self.conn.identity.projects())
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_os_image_list(self):
         """
-        Get the list of images from the Glance client.
+        Get the list of images from OpenStack.
         """
-        glance_images = self.glance.images.list()
+        images = list(self.conn.image.images())
         image_list = []
 
-        for image in glance_images:
-            image_list.append(image['name'])
+        for image in images:
+            image_list.append(image.name)
 
         return image_list
 
@@ -216,9 +97,9 @@ class OpenStackInterface:
 
     def get_os_vm_list(self):
         """
-        Get the list of virtual machines from the Nova client.
+        Get the list of virtual machines from OpenStack.
         """
-        return self.nova.servers.list()
+        return list(self.conn.compute.servers())
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -230,9 +111,9 @@ class OpenStackInterface:
 
         network_id = '41117794-0b4c-4dd3-8f2b-7d9bb458e968'  # default to rcs network
 
-        for network in self.neutron.list_networks()['networks']:
-            if network['name'].lower() == faculty_name.lower():
-                network_id = network['id']
+        for network in self.conn.network.networks():
+            if network.name.lower() == faculty_name.lower():
+                network_id = network.id
                 break
 
         return network_id
@@ -241,11 +122,10 @@ class OpenStackInterface:
 
     def get_networks_ids(self):
         """
-        Get the list of networks from the Neutron client.
+        Get the list of network IDs from OpenStack.
         """
-        networks = self.neutron.list_networks()['networks']
-
-        network_list = [network['id'] for network in networks]
+        networks = list(self.conn.network.networks())
+        network_list = [network.id for network in networks]
 
         return network_list
 
@@ -253,21 +133,21 @@ class OpenStackInterface:
 
     def get_networks(self):
         """
-        Get the list of networks from the Neutron client.
+        Get the list of networks from OpenStack.
         """
-        return self.neutron.list_networks()['networks']
+        return list(self.conn.network.networks())
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_security_groups(self):
         """
-        Get the list of security groups from the Nova client.
+        Get the list of security groups from OpenStack.
         """
-        security_groups = self.nova.security_groups.list()
+        security_groups = list(self.conn.network.security_groups())
         security_group_list = []
 
         for sg in security_groups:
-            security_group_list.append(sg['name'])
+            security_group_list.append(sg.name)
 
         return security_group_list
 
@@ -275,9 +155,9 @@ class OpenStackInterface:
 
     def get_flavor_list(self):
         """
-        Get the list of flavors from the Nova client.
+        Get the list of flavors from OpenStack.
         """
-        return self.nova.flavors.list()
+        return list(self.conn.compute.flavors())
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -285,35 +165,37 @@ class OpenStackInterface:
 
         flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
 
-        return  self.nova.flavors.create(   name=flavour_name,
-                                            ram=ram * 1024,  # MB
-                                            vcpus=vcpus,
-                                            disk=disk)
+        return self.conn.compute.create_flavor(
+            name=flavour_name,
+            ram=ram * 1024,  # MB
+            vcpus=vcpus,
+            disk=disk
+        )
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def assosciate_floating_ip(self, vm, network_id):
 
         try:
-            floating_ip = self.neutron.create_floatingip({'floatingip': {'floating_network_id': network_id}})
+            floating_ip = self.conn.network.create_ip(floating_network_id=network_id)
         except Exception as e:
             raise ValueError(f"Failed to allocate floating IP: {e}")
 
         if floating_ip:
-            floating_ip_id = floating_ip['floatingip']["id"]
-            floating_ip_address = floating_ip['floatingip']["floating_ip_address"]
+            floating_ip_id = floating_ip.id
+            floating_ip_address = floating_ip.floating_ip_address
 
         # Wait for the VM to be in ACTIVE state
         time.sleep(10)
 
-        ports = self.neutron.list_ports(device_id=vm.id)
+        ports = list(self.conn.network.ports(device_id=vm.id))
 
-        for port in ports['ports']:
-            port_id= port['id']
+        for port in ports:
+            port_id = port.id
 
             # Assign the floating IP to the port
             try:
-                self.neutron.update_floatingip(floating_ip_id, {'floatingip': {'port_id': port_id}})
+                self.conn.network.update_ip(floating_ip_id, port_id=port_id)
             except Exception as e:
                 print(f"Error assigning floating IP {floating_ip_address} to port {port_id}: {e}")
 
@@ -325,14 +207,11 @@ class OpenStackInterface:
                             vm_hostname : str,
                             floating_ip_address : str):
 
-        # self._switch_project('admin')
-
         try:
-        #    self.neutron.delete_floatingip(floating_ip_address)
-            for fip in self.neutron.list_floatingips()['floatingips']:
-                if fip['floating_ip_address'] == floating_ip_address:
-                    self.neutron.update_floatingip(fip['id'], {'floatingip': {'port_id': None}})
-                    self.neutron.delete_floatingip(fip['id'])
+            for fip in self.conn.network.ips():
+                if fip.floating_ip_address == floating_ip_address:
+                    self.conn.network.update_ip(fip.id, port_id=None)
+                    self.conn.network.delete_ip(fip.id)
                     return True
 
         except Exception as e:
@@ -349,7 +228,7 @@ class OpenStackInterface:
 
         self._switch_project(project_name)
 
-        print(f"{self._get_creds()}")
+        print(f"Creating VM in project: {project_name}")
 
         # TODO: check to see if there are any floating IPs available in the project
 
@@ -358,17 +237,16 @@ class OpenStackInterface:
         with open(self.vm_setup_script_path, 'r') as f:
             user_data = f.read()
 
-        # create the VM using the Nova client
+        # create the VM using the OpenStack SDK
         try:
-            vm = self.nova.servers.create(  name=hostname,
-                                            image=image,
-                                            flavor=flavour,
-                                            key_name='newmaster',
-                                            nics=networks,
-                                            userdata=user_data)
-
-        except novaclient.exceptions.Forbidden as e:
-            raise ValueError(f"Permission denied to create VM in project '{self._get_creds()}': {e}")
+            vm = self.conn.compute.create_server(
+                name=hostname,
+                image_id=image.id if hasattr(image, 'id') else image,
+                flavor_id=flavour.id if hasattr(flavour, 'id') else flavour,
+                key_name='newmaster',
+                networks=networks,
+                user_data=user_data
+            )
 
         except Exception as e:
             raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
@@ -389,7 +267,7 @@ class OpenStackInterface:
     def _get_server_by_name(self,
                             vm_hostname : str):
 
-        servers = self.nova.servers.list(search_opts={'all_tenants': True})
+        servers = list(self.conn.compute.servers())
 
         vms = [s for s in servers if s.name == vm_hostname]
 
@@ -406,7 +284,7 @@ class OpenStackInterface:
                   vm_hostname : str):
         try:
             vm = self._get_server_by_name(vm_hostname)
-            self.nova.servers.delete(vm.id)
+            self.conn.compute.delete_server(vm.id)
             return True
         except Exception as e:
             raise ValueError(f"Failed to delete VM {vm_hostname}: {e}")
@@ -417,7 +295,7 @@ class OpenStackInterface:
     def get_os_image_by_name(   self,
                                 selected_image_name : str):
         """
-        Get the image object from the Glance client by name.
+        Get the image object from OpenStack by name.
 
         Args:
             image_name (str): The name of the image to retrieve.
@@ -425,8 +303,8 @@ class OpenStackInterface:
         Returns:
             Image object if found, None otherwise.
         """
-        glance_images = self.glance.images.list()
-        image = next((img for img in glance_images if img.name == selected_image_name), None)
+        images = list(self.conn.image.images())
+        image = next((img for img in images if img.name == selected_image_name), None)
 
         return image
 
@@ -435,14 +313,15 @@ class OpenStackInterface:
     def get_server(self,
                    vm_id : str):
 
-        return self.nova.servers.get(vm_id)
+        return self.conn.compute.get_server(vm_id)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_vm_hypervisor_name(self,
                                vm_id : str):
 
-        return self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
+        server = self.get_server(vm_id)
+        return getattr(server, 'host', None)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -450,19 +329,8 @@ class OpenStackInterface:
                             vcpus : int,
                             ram_mb : int,
                             disk_gb : int) -> bool:
-        """
-        Check if the requested resources are available in the OpenStack cluster.
 
-        Args:
-            vcpus (int): Number of virtual CPUs requested.
-            ram_mb (int): Amount of RAM in MB requested.
-            disk_gb (int): Amount of disk space in GB requested.
+        for hypervisor in self.conn.compute.v2.hypervisors(details=False):
+            print(hypervisor.to_dict())
 
-        Returns:
-            bool: True if resources are available, False otherwise.
-        """
-
-        available_resources = self.placement.get_allocated_resources()
-        return (available_resources['vcpus'] >= vcpus and
-                available_resources['ram_mb'] >= ram_mb and
-                available_resources['disk_gb'] >= disk_gb)
+        return False
