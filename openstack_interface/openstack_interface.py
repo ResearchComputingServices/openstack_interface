@@ -1,3 +1,4 @@
+import datetime
 import os
 import time
 
@@ -7,9 +8,9 @@ from glanceclient import client as glanceclient
 from keystoneauth1 import loading
 from keystoneauth1 import session as keystone_session
 from keystoneclient.v3 import client as keystone_client
-from openstack_placement import client as placement_client
 
 from pprint import pprint
+
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # OpenStack Nova and Glance API Version and Credentials
@@ -50,13 +51,18 @@ class OpenStackInterface:
     def __init__(self,
                  vm_setup_script_path : str,
                  gpu_setup_script_path : str,
-                 monitor_setup_script_path : str):
+                 add_user_script_path : str,
+                 final_setup_script_path : str,
+                 private_key_path : str,
+                 external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d'):
 
         # TODO: add error checking for the script paths
         # paths to the setup scripts to be copied to the VMs
         self.vm_setup_script_path = vm_setup_script_path
         self.gpu_setup_script_path = gpu_setup_script_path
-        self.monitor_setup_script_path = monitor_setup_script_path
+        self.add_user_script_path = add_user_script_path
+        self.final_setup_script_path = final_setup_script_path
+        self.private_key_path = private_key_path
 
         # initialize the OpenStack clients
         self.nova = None
@@ -71,8 +77,13 @@ class OpenStackInterface:
         self.keystone = None
         self._init_keystone_client()
 
-        self.placement = None
-        self._init_placement_client()
+        # Read the VM setup script file as a bytes object
+        self.vm_setup_script = None
+        with open(self.vm_setup_script_path, 'r') as f:
+            self.vm_setup_script = f.read()
+
+        # used for associating floating IPs
+        self.external_network_id = external_network_id
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -94,21 +105,6 @@ class OpenStackInterface:
     def _set_project_name(self, project_name: str):
 
         os.environ[OS_PROJECT_NAME] = project_name
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_placement_client(self):
-        """
-        Initialize the Placement client with the credentials.
-        """
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.placement = placement_client.Client(session=sess)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -322,11 +318,7 @@ class OpenStackInterface:
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def release_floating_ip(self,
-                            vm_hostname : str,
                             floating_ip_address : str):
-
-        # self._switch_project('admin')
-
         try:
         #    self.neutron.delete_floatingip(floating_ip_address)
             for fip in self.neutron.list_floatingips()['floatingips']:
@@ -340,6 +332,17 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def _check_floating_ips_available(self):
+
+        for fip in self.neutron.list_floatingips()['floatingips']:
+            if fip.get('port_id') is None:
+                self.release_floating_ip(fip['floating_ip_address'])
+                return True
+
+        return False
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def create_vm(self,
                   project_name : str,
                   hostname : str,
@@ -349,14 +352,10 @@ class OpenStackInterface:
 
         self._switch_project(project_name)
 
-        print(f"{self._get_creds()}")
-
-        # TODO: check to see if there are any floating IPs available in the project
-
-        # TODO: this needs to be loaded only once
-        # Read the script file and use it as user_data
-        with open(self.vm_setup_script_path, 'r') as f:
-            user_data = f.read()
+        # check to see if there are any floating IPs available in the project
+        if not self._check_floating_ips_available():
+            raise ValueError(   f"No floating IPs available in project '{project_name}'. "
+                                f"Cannot create VM.")
 
         # create the VM using the Nova client
         try:
@@ -365,24 +364,40 @@ class OpenStackInterface:
                                             flavor=flavour,
                                             key_name='newmaster',
                                             nics=networks,
-                                            userdata=user_data)
+                                            userdata=self.vm_setup_script)
+
+            if vm.status == 'ERROR':
+                raise ValueError(f"Failed to create VM: VM entered ERROR state.")
 
         except novaclient.exceptions.Forbidden as e:
-            raise ValueError(f"Permission denied to create VM in project '{self._get_creds()}': {e}")
+            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self._get_creds()}': {e}")
 
         except Exception as e:
             raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
 
-
-        # TODO: instead of hard coding the network ID, we should get it from the Neutron client
         # Associate a floating IP to the VM
-        floating_ip = self.assosciate_floating_ip(vm, 'bb005c60-fb45-481a-97fb-f746033e1c5d')
-
-        # TODO: run the 'final.sh' script on the VM to complete the setup
-
-        # TODO: Check if the VM has a GPU and if so run the GPU setup script on the VM
+        try:
+            floating_ip = self.assosciate_floating_ip(vm, self.external_network_id)
+        except Exception as e:
+            raise ValueError(f"Failed to associate floating IP to VM '{hostname}': {e}")
 
         return vm, floating_ip
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_vm_by_floating_ip(self,
+                              floating_ip_address : str):
+
+        servers = self.nova.servers.list(search_opts={'all_tenants': True})
+
+        for server in servers:
+            addresses = server.addresses
+            for network in addresses.values():
+                for addr in network:
+                    if addr.get('OS-EXT-IPS:type') == 'floating' and addr.get('addr') == floating_ip_address:
+                        return server
+
+        return None
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -443,26 +458,3 @@ class OpenStackInterface:
                                vm_id : str):
 
         return self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def resources_available(self,
-                            vcpus : int,
-                            ram_mb : int,
-                            disk_gb : int) -> bool:
-        """
-        Check if the requested resources are available in the OpenStack cluster.
-
-        Args:
-            vcpus (int): Number of virtual CPUs requested.
-            ram_mb (int): Amount of RAM in MB requested.
-            disk_gb (int): Amount of disk space in GB requested.
-
-        Returns:
-            bool: True if resources are available, False otherwise.
-        """
-
-        available_resources = self.placement.get_allocated_resources()
-        return (available_resources['vcpus'] >= vcpus and
-                available_resources['ram_mb'] >= ram_mb and
-                available_resources['disk_gb'] >= disk_gb)
