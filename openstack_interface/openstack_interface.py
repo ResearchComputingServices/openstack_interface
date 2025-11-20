@@ -457,4 +457,9 @@ class OpenStackInterface:
     def get_vm_hypervisor_name(self,
                                vm_id : str):
 
-        return self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
+        full_server_name = self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
+
+        # this removes the domain part of the hypervisor name (.maas)
+        hypervisor_name = full_server_name.split('.')[0] if full_server_name else None
+
+        return hypervisor_name
