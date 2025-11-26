@@ -1,6 +1,8 @@
-import datetime
 import os
 import time
+import random
+
+from pprint import pprint
 
 from novaclient import client as novaclient
 from neutronclient.v2_0 import client as neutronclient
@@ -9,15 +11,10 @@ from keystoneauth1 import loading
 from keystoneauth1 import session as keystone_session
 from keystoneclient.v3 import client as keystone_client
 
-from pprint import pprint
-
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# OpenStack Nova and Glance API Version and Credentials
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# TODO: clean up the definitions below - some are not used - maybe use a dataclass?
 NOVA_API_VERSION = "2.0"
+GLANCE_API_VERSION = "2"
 
 OS_USERNAME = 'OS_USERNAME'
 OS_PASSWORD = 'OS_PASSWORD'
@@ -49,11 +46,11 @@ NOVA_CREDS_KEYS = [
 class OpenStackInterface:
 
     def __init__(self,
-                 vm_setup_script_path : str,
-                 gpu_setup_script_path : str,
-                 add_user_script_path : str,
-                 final_setup_script_path : str,
-                 private_key_path : str,
+                 vm_setup_script_path : str = None,
+                 gpu_setup_script_path : str = None,
+                 add_user_script_path : str = None,
+                 final_setup_script_path : str = None,
+                 private_key_path : str = None,
                  external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d'):
 
         # TODO: add error checking for the script paths
@@ -64,30 +61,39 @@ class OpenStackInterface:
         self.final_setup_script_path = final_setup_script_path
         self.private_key_path = private_key_path
 
-        # initialize the OpenStack clients
-        self.nova = None
-        self._init_nova_client()
-
-        self.glance = None
-        self._init_glance_client()
-
-        self.neutron = None
-        self._init_neutron_client()
-
-        self.keystone = None
-        self._init_keystone_client()
-
         # Read the VM setup script file as a bytes object
         self.vm_setup_script = None
-        with open(self.vm_setup_script_path, 'r') as f:
-            self.vm_setup_script = f.read()
+        if self.vm_setup_script_path is not None:
+            with open(self.vm_setup_script_path, 'r') as f:
+                self.vm_setup_script = f.read()
 
-        # used for associating floating IPs
+        # set the external network ID
         self.external_network_id = external_network_id
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # initialize the OpenStack session
+        self.openstack_session = self.init_openstack_session()
 
-    def _get_creds(self):
+        # initialize the OpenStack clients
+        self.initialize_clients()
+
+        # get the list of projects since you have to be admin to list projects
+        self.project_list = self.ks_client.projects.list()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def set_project_name_env_var(self, project_name: str):
+
+        os.environ[OS_PROJECT_NAME] = project_name
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_project_name_env_var(self):
+
+        return os.environ.get(OS_PROJECT_NAME, None)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_creds(self):
 
         d = {}
 
@@ -96,103 +102,316 @@ class OpenStackInterface:
             if value is not None:
                 d[key] = value
             else:
-                raise ValueError(f"Environment variable {env_var} is not set. Please set it before running the script.")
+                raise ValueError(f"Environment variable {env_var} is not set."
+                                    f"Please set it before running the script.")
 
         return d
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _set_project_name(self, project_name: str):
-
-        os.environ[OS_PROJECT_NAME] = project_name
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _init_neutron_client(self):
+    def init_openstack_session(self):
         """
-        Initialize the Neutron client with the credentials.
+        Initialize the OpenStack session with the credentials.
         """
-        creds = self._get_creds()
-
+        creds = self.get_creds()
         loader = loading.get_plugin_loader('password')
         auth = loader.load_from_options(**creds)
 
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.neutron = neutronclient.Client(session=sess)
+        return keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _init_nova_client(self):
+    def initialize_clients(self):
         """
-        Initialize the Nova client with the credentials.
+        Initialize the OpenStack clients.
         """
-
-        creds = self._get_creds()
-
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        # TODO: I think we should be able to get rid of this?
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.nova = novaclient.Client(NOVA_API_VERSION, **creds, cacert=os.environ['OS_CACERT'])
+        if self.openstack_session:
+            self.nova_client = novaclient.Client(NOVA_API_VERSION, session=self.openstack_session)
+            self.glance_client = glanceclient.Client(GLANCE_API_VERSION, session=self.openstack_session)
+            self.neutron_client = neutronclient.Client(session=self.openstack_session)
+            self.ks_client = keystone_client.Client(session=self.openstack_session)
+        else:
+            raise ValueError("OpenStack session is required to initialize Neutron client.")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _init_glance_client(self):
+    def check_project_exists(self, project_name=None):
         """
-        Initialize the Glance client with the credentials.
+        Check if a project exists.
         """
-        creds = self._get_creds()
+        if project_name is None:
+            raise ValueError("Project name must be provided to check existence.")
 
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
+        for project in self.project_list:
+            if project.name == project_name:
+                return True
 
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.glance = glanceclient.Client("2", session=sess)
+        return False
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _init_keystone_client(self):
+    def project_name_from_id(self, project_id=None):
         """
-        Initialize the Keystone client with the credentials.
+        Get the project name from its ID.
         """
-        creds = self._get_creds()
+        project = self.ks_client.projects.get(project_id)
+        if project is None:
+            raise ValueError(f"Project with ID {project_id} does not exist.")
 
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
-
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
-
-        self.keystone = keystone_client.Client(session=sess)
+        return project.name
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _switch_project(self, project_name: str):
+    def change_project( self,
+                        project_name=None,
+                        project_id=None):
         """
-        Switch the Nova client to a different project.
+        Change the current project by setting the OS_PROJECT_NAME environment variable.
         """
-        self._set_project_name(project_name)
+        # check that at least one of project_name or project_id is provided
+        if project_name is None and project_id is None:
+            raise ValueError("Either project name or project ID must be provided to change the project.")
 
-        creds = self._get_creds()
-        loader = loading.get_plugin_loader('password')
-        auth = loader.load_from_options(**creds)
+        # if project_id is provided, get the project name
+        if project_id is not None:
+            try:
+                project_name = self.project_name_from_id(project_id=project_id)
+            except ValueError as e:
+                raise e
 
-        # TODO: I think we should be able to get rid of this?
-        sess = keystone_session.Session(auth=auth,verify=os.environ['OS_CACERT'])
+        # check that the project exists
+        if not self.check_project_exists(project_name=project_name):
+            raise ValueError(f"Project with name {project_name} does not exist.")
 
-        self.nova = novaclient.Client(NOVA_API_VERSION, **creds, cacert=os.environ['OS_CACERT'])
-        self.neutron = neutronclient.Client(session=sess)
+        # after all checks, set the project name in the environment variable
+        self.set_project_name_env_var(project_name)
+        self.openstack_session = self.init_openstack_session()
+        self.initialize_clients()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _allocate_fip(self):
+
+        """
+        Allocate a floating IP to the ACTIVE PROJECT.
+        """
+
+        body = {"floatingip": {"floating_network_id": self.external_network_id}}
+
+        return self.neutron_client.create_floatingip(body)['floatingip']
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _get_fip(self):
+        """
+        Get a floating IP from the ACTIVE PROJECT.
+        """
+
+        # First check if there are any floating IPs allocated to the project
+        # if not then try to allocate one
+        if self.get_num_allocated_floating_ips() == 0:
+            print("No floating IPs allocated to the project. Allocating one...")
+            self._allocate_fip()
+
+        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+
+        for fip in floating_ips:
+            if not fip['port_id']:
+                return fip
+
+        raise ValueError("No available floating IPs found.")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _get_fip_associated_to_port(self, port_id):
+        # try to find the floating IP associated with the port
+        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+        fip = None
+        for floating_ip in floating_ips:
+            if floating_ip['port_id'] == port_id:
+                fip = floating_ip
+                break
+
+        if fip is None:
+            raise ValueError(f"No floating IP associated with port ID: {port_id}")
+
+        return fip
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _disassociate_fip(self, fip):
+
+        try:
+            self.neutron_client.update_floatingip(fip['id'], {"floatingip": {"port_id": None}})
+            print(f"Disassociated Floating IP {fip['floating_ip_address']}")
+        except Exception as e:
+            raise e
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _associate_fip(self, fip, port_id):
+
+        try:
+            self.neutron_client.update_floatingip(fip['id'], {"floatingip": {"port_id": port_id}})
+            print(f"Associated Floating IP {fip['floating_ip_address']} with port ID {port_id}")
+        except Exception as e:
+            raise e
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _release_fip(self, fip=None):
+        """
+        Release a floating IP by its ID.
+        """
+        if fip:
+            print(f"Releasing Floating IP {fip.get('floating_ip_address')}")
+            self.neutron_client.delete_floatingip(fip.get('id'))
+        else:
+            raise ValueError("Floating IP data structure must be provided to release the floating IP.")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def detach_fip_from_vm(self, vm):
+
+        """
+        Disassociate a floating IP from a port.
+        """
+
+        # set the active project to the VM's tenant
+        self.change_project(project_id=vm.tenant_id)
+
+        # try to get the port ID of the VM
+        try:
+            port_id = self.get_vm_port_id(vm)
+            print(f"Found port ID for VM {vm.name}: {port_id}")
+        except ValueError as e:
+            raise e
+
+        # try to get the floating IP associated with the port
+        try:
+            fip = self._get_fip_associated_to_port(port_id)
+            print(f"Found Floating IP {fip['floating_ip_address']} associated with port ID {port_id}")
+        except ValueError as e:
+            raise e
+
+        # try to disassociate the floating IP
+        try:
+            self._disassociate_fip(fip)
+        except Exception as e:
+            raise e
+
+        # release the floating IP so it can be used in another project
+        try:
+            self._release_fip(fip)
+        except Exception as e:
+            raise e
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def attach_fip_to_vm(self, vm):
+        """
+        Associate a floating IP to a port.
+        """
+
+        # set the active project to the VM's tenant
+        self.change_project(project_id=vm.tenant_id)
+
+        # try to get a floating IP
+        try:
+            fip = self._get_fip()
+            print(f"Found available Floating IP: {fip['floating_ip_address']}")
+        except ValueError as e:
+            raise e
+
+        # try to get the port ID of the VM
+        try:
+            port_id = self.get_vm_port_id(vm)
+            print(f"Found port ID for VM {vm.name}: {port_id}")
+        except ValueError as e:
+            raise e
+
+        try:
+            self._associate_fip(fip, port_id)
+        except Exception as e:
+            raise e
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def create_flavor(self, vcpus, ram, disk):
+
+        flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
+
+        return  self.nova_client.flavors.create(name=flavour_name,
+                                                ram=ram * 1024,  # MB
+                                                vcpus=vcpus,
+                                                disk=disk)
+
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def check_floating_ips_available(self):
+        """
+        Check if there are any floating IPs available in the ACTIVE PROJECT.
+        """
+
+        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+
+        pprint(floating_ips)
+
+        for fip in floating_ips:
+
+            if not fip['port_id']:
+                return True
+
+        return False
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_num_allocated_floating_ips(self):
+        """
+        Get the number of allocated floating IPs.
+        """
+        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+        num_allocated = len(floating_ips)
+
+        return num_allocated
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_vm(self, vm_name=None):
+        """
+        Get a VM by its name.
+        """
+        if vm_name is None:
+            raise ValueError("VM name must be provided to get the VM.")
+
+        for server in self.nova_client.servers.list(search_opts={'all_tenants': True}):
+            if server.name == vm_name:
+                return server
+
+        raise ValueError(f"VM with name {vm_name} not found.")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_vm_port_id(self, vm):
+        """
+        Get the port ID of a VM.
+        """
+        server_interfaces = self.nova_client.servers.interface_list(vm.id)
+        if not server_interfaces:
+            raise ValueError(f"No interfaces found for VM with ID {vm.id}.")
+
+        port_id = server_interfaces[0].port_id
+
+        return port_id
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_projects(self):
         """
-        Get the list of projects from the Keystone client.
+        Get the list of projects.
         """
-        return self.keystone.projects.list()
+        return self.project_list
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -200,7 +419,7 @@ class OpenStackInterface:
         """
         Get the list of images from the Glance client.
         """
-        glance_images = self.glance.images.list()
+        glance_images = self.glance_client.images.list()
         image_list = []
 
         for image in glance_images:
@@ -209,24 +428,17 @@ class OpenStackInterface:
         return image_list
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def get_os_vm_list(self):
-        """
-        Get the list of virtual machines from the Nova client.
-        """
-        return self.nova.servers.list()
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+    # TODO: change this function name to reflect its purpose better (ie get_faculty_network_id)
     def get_network_id(self,
                        faculty_name : str):
         """
         Get the network ID for a given faculty name.
         """
-
+        # TODO: This is a temporary implementation until we have a better way to map
+        # faculty names to network IDs.
         network_id = '41117794-0b4c-4dd3-8f2b-7d9bb458e968'  # default to rcs network
 
-        for network in self.neutron.list_networks()['networks']:
+        for network in self.neutron_client.list_networks()['networks']:
             if network['name'].lower() == faculty_name.lower():
                 network_id = network['id']
                 break
@@ -235,160 +447,10 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def get_networks_ids(self):
-        """
-        Get the list of networks from the Neutron client.
-        """
-        networks = self.neutron.list_networks()['networks']
-
-        network_list = [network['id'] for network in networks]
-
-        return network_list
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def get_networks(self):
-        """
-        Get the list of networks from the Neutron client.
-        """
-        return self.neutron.list_networks()['networks']
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def get_security_groups(self):
-        """
-        Get the list of security groups from the Nova client.
-        """
-        security_groups = self.nova.security_groups.list()
-        security_group_list = []
-
-        for sg in security_groups:
-            security_group_list.append(sg['name'])
-
-        return security_group_list
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def get_flavor_list(self):
-        """
-        Get the list of flavors from the Nova client.
-        """
-        return self.nova.flavors.list()
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def create_flavor(self, vcpus, ram, disk):
-
-        flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
-
-        return  self.nova.flavors.create(   name=flavour_name,
-                                            ram=ram * 1024,  # MB
-                                            vcpus=vcpus,
-                                            disk=disk)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def assosciate_floating_ip(self, vm, network_id):
-
-        try:
-            floating_ip = self.neutron.create_floatingip({'floatingip': {'floating_network_id': network_id}})
-        except Exception as e:
-            raise ValueError(f"Failed to allocate floating IP: {e}")
-
-        if floating_ip:
-            floating_ip_id = floating_ip['floatingip']["id"]
-            floating_ip_address = floating_ip['floatingip']["floating_ip_address"]
-
-        # Wait for the VM to be in ACTIVE state
-        time.sleep(10)
-
-        ports = self.neutron.list_ports(device_id=vm.id)
-
-        for port in ports['ports']:
-            port_id= port['id']
-
-            # Assign the floating IP to the port
-            try:
-                self.neutron.update_floatingip(floating_ip_id, {'floatingip': {'port_id': port_id}})
-            except Exception as e:
-                print(f"Error assigning floating IP {floating_ip_address} to port {port_id}: {e}")
-
-        return floating_ip_address
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def release_floating_ip(self,
-                            floating_ip_address : str):
-        try:
-        #    self.neutron.delete_floatingip(floating_ip_address)
-            for fip in self.neutron.list_floatingips()['floatingips']:
-                if fip['floating_ip_address'] == floating_ip_address:
-                    self.neutron.update_floatingip(fip['id'], {'floatingip': {'port_id': None}})
-                    self.neutron.delete_floatingip(fip['id'])
-                    return True
-
-        except Exception as e:
-            raise e
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def _check_floating_ips_available(self):
-
-        for fip in self.neutron.list_floatingips()['floatingips']:
-            if fip.get('port_id') is None:
-                self.release_floating_ip(fip['floating_ip_address'])
-                return True
-
-        return False
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def create_vm(self,
-                  project_name : str,
-                  hostname : str,
-                  flavour,
-                  image,
-                  networks : list):
-
-        self._switch_project(project_name)
-
-        # check to see if there are any floating IPs available in the project
-        if not self._check_floating_ips_available():
-            raise ValueError(   f"No floating IPs available in project '{project_name}'. "
-                                f"Cannot create VM.")
-
-        # create the VM using the Nova client
-        try:
-            vm = self.nova.servers.create(  name=hostname,
-                                            image=image,
-                                            flavor=flavour,
-                                            key_name='newmaster',
-                                            nics=networks,
-                                            userdata=self.vm_setup_script)
-
-            if vm.status == 'ERROR':
-                raise ValueError(f"Failed to create VM: VM entered ERROR state.")
-
-        except novaclient.exceptions.Forbidden as e:
-            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self._get_creds()}': {e}")
-
-        except Exception as e:
-            raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
-
-        # Associate a floating IP to the VM
-        try:
-            floating_ip = self.assosciate_floating_ip(vm, self.external_network_id)
-        except Exception as e:
-            raise ValueError(f"Failed to associate floating IP to VM '{hostname}': {e}")
-
-        return vm, floating_ip
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
     def get_vm_by_floating_ip(self,
                               floating_ip_address : str):
 
-        servers = self.nova.servers.list(search_opts={'all_tenants': True})
+        servers = self.nova_client.servers.list(search_opts={'all_tenants': True})
 
         for server in servers:
             addresses = server.addresses
@@ -401,31 +463,11 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _get_server_by_name(self,
-                            vm_hostname : str):
-
-        servers = self.nova.servers.list(search_opts={'all_tenants': True})
-
-        vms = [s for s in servers if s.name == vm_hostname]
-
-        if len(vms) == 0:
-            raise ValueError(f"VM {vm_hostname} not found")
-        elif len(vms) > 1:
-            raise ValueError(f"Multiple VMs with the name {vm_hostname} found")
-        else:
-            return vms[0]
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-    def delete_vm(self,
-                  vm_hostname : str):
-        try:
-            vm = self._get_server_by_name(vm_hostname)
-            self.nova.servers.delete(vm.id)
-            return True
-        except Exception as e:
-            raise ValueError(f"Failed to delete VM {vm_hostname}: {e}")
-
+    def get_flavor_list(self):
+        """
+        Get the list of flavors from the Nova client.
+        """
+        return self.nova_client.flavors.list()
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -440,26 +482,51 @@ class OpenStackInterface:
         Returns:
             Image object if found, None otherwise.
         """
-        glance_images = self.glance.images.list()
+        glance_images = self.glance_client.images.list()
         image = next((img for img in glance_images if img.name == selected_image_name), None)
 
         return image
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def get_server(self,
-                   vm_id : str):
+    def create_vm(self,
+                  project_name : str,
+                  hostname : str,
+                  flavour,
+                  image,
+                  networks : list):
 
-        return self.nova.servers.get(vm_id)
+        self.change_project(project_name=project_name)
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # check to see if there are any floating IPs available in the project
+        # if not self.check_floating_ips_available():
+        #     raise ValueError(   f"No floating IPs available in project '{project_name}'. "
+        #                         f"Cannot create VM.")
 
-    def get_vm_hypervisor_name(self,
-                               vm_id : str):
+        # create the VM using the Nova client
+        try:
+            vm = self.nova_client.servers.create(   name=hostname,
+                                                    image=image,
+                                                    flavor=flavour,
+                                                    key_name='newmaster',
+                                                    nics=networks,
+                                                    userdata=self.vm_setup_script)
 
-        full_server_name = self.get_server(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
+            if vm.status == 'ERROR':
+                raise ValueError(f"Failed to create VM: VM entered ERROR state.")
 
-        # this removes the domain part of the hypervisor name (.maas)
-        hypervisor_name = full_server_name.split('.')[0] if full_server_name else None
+            while vm.status != 'ACTIVE':
+                print(f"Waiting for VM {hostname} to become ACTIVE. Current status: {vm.status}")
+                time.sleep(1)
+                vm = self.nova_client.servers.get(vm.id)
 
-        return hypervisor_name
+            return vm
+
+        except novaclient.exceptions.Forbidden as e:
+            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self._get_creds()}': {e}")
+
+        except Exception as e:
+            raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
+
+
+# =================================================================================================
