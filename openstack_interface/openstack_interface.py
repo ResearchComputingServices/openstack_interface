@@ -47,19 +47,12 @@ class OpenStackInterface:
 
     def __init__(self,
                  vm_setup_script_path : str = None,
-                 gpu_setup_script_path : str = None,
-                 add_user_script_path : str = None,
-                 final_setup_script_path : str = None,
-                 private_key_path : str = None,
-                 external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d'):
+                 external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d',
+                 key_name : str = 'newmaster'):
 
         # TODO: add error checking for the script paths
-        # paths to the setup scripts to be copied to the VMs
         self.vm_setup_script_path = vm_setup_script_path
-        self.gpu_setup_script_path = gpu_setup_script_path
-        self.add_user_script_path = add_user_script_path
-        self.final_setup_script_path = final_setup_script_path
-        self.private_key_path = private_key_path
+        self.key_name = key_name
 
         # Read the VM setup script file as a bytes object
         self.vm_setup_script = None
@@ -335,6 +328,8 @@ class OpenStackInterface:
         except Exception as e:
             raise e
 
+        return fip['floating_ip_address']
+
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def create_flavor(self, vcpus, ram, disk):
@@ -489,6 +484,18 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def get_vm_hypervisor_name(self,
+                               vm_id : str):
+
+        full_server_name = self.nova_client.servers.get(vm_id).to_dict().get("OS-EXT-SRV-ATTR:host")
+
+        # this removes the domain part of the hypervisor name (.maas)
+        hypervisor_name = full_server_name.split('.')[0] if full_server_name else None
+
+        return hypervisor_name
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def create_vm(self,
                   project_name : str,
                   hostname : str,
@@ -508,7 +515,7 @@ class OpenStackInterface:
             vm = self.nova_client.servers.create(   name=hostname,
                                                     image=image,
                                                     flavor=flavour,
-                                                    key_name='newmaster',
+                                                    key_name=self.key_name,
                                                     nics=networks,
                                                     userdata=self.vm_setup_script)
 
