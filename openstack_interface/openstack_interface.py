@@ -191,7 +191,11 @@ class OpenStackInterface:
 
         body = {"floatingip": {"floating_network_id": self.external_network_id}}
 
-        return self.neutron_client.create_floatingip(body)['floatingip']
+        try:
+            return self.neutron_client.create_floatingip(body)['floatingip']
+        except Exception as e:
+            print(f"Error allocating floating IP: {e}")
+            return None
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -341,7 +345,6 @@ class OpenStackInterface:
                                                 vcpus=vcpus,
                                                 disk=disk)
 
-
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def check_floating_ips_available(self):
@@ -349,16 +352,13 @@ class OpenStackInterface:
         Check if there are any floating IPs available in the ACTIVE PROJECT.
         """
 
-        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+        fip = self._allocate_fip()
 
-        pprint(floating_ips)
-
-        for fip in floating_ips:
-
-            if not fip['port_id']:
-                return True
-
-        return False
+        if fip:
+            # release the allocated floating IP since this is just a check
+            return True
+        else:
+            return False
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -505,11 +505,6 @@ class OpenStackInterface:
 
         self.change_project(project_name=project_name)
 
-        # check to see if there are any floating IPs available in the project
-        # if not self.check_floating_ips_available():
-        #     raise ValueError(   f"No floating IPs available in project '{project_name}'. "
-        #                         f"Cannot create VM.")
-
         # create the VM using the Nova client
         try:
             vm = self.nova_client.servers.create(   name=hostname,
@@ -522,6 +517,7 @@ class OpenStackInterface:
             if vm.status == 'ERROR':
                 raise ValueError(f"Failed to create VM: VM entered ERROR state.")
 
+            # wait for the VM to become ACTIVE
             while vm.status != 'ACTIVE':
                 print(f"Waiting for VM {hostname} to become ACTIVE. Current status: {vm.status}")
                 time.sleep(1)
