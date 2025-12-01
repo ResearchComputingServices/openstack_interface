@@ -424,14 +424,18 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # TODO: change this function name to reflect its purpose better (ie get_faculty_network_id)
+
+    def get_default_network_id(self):
+        for network in self.neutron_client.list_networks()['networks']:
+            if network['name'].lower() == 'rcs':
+                return network['id']
+
     def get_network_id(self,
                        faculty_name : str):
         """
         Get the network ID for a given faculty name.
         """
-        # TODO: This is a temporary implementation until we have a better way to map
-        # faculty names to network IDs.
-        network_id = '41117794-0b4c-4dd3-8f2b-7d9bb458e968'  # default to rcs network
+        network_id = self.get_default_network_id()  # default to rcs network
 
         for network in self.neutron_client.list_networks()['networks']:
             if network['name'].lower() == faculty_name.lower():
