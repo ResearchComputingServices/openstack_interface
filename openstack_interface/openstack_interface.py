@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import logging
 
 from pprint import pprint
 
@@ -10,6 +11,9 @@ from glanceclient import client as glanceclient
 from keystoneauth1 import loading
 from keystoneauth1 import session as keystone_session
 from keystoneclient.v3 import client as keystone_client
+
+# Initialize logger for OpenStack Interface
+logger = logging.getLogger('cloudman.app.openstack')
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -50,6 +54,7 @@ class OpenStackInterface:
                  external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d',
                  key_name : str = 'newmaster'):
 
+        logger.info("Initializing OpenStackInterface")
         # TODO: add error checking for the script paths
         self.vm_setup_script_path = vm_setup_script_path
         self.key_name = key_name
@@ -57,20 +62,26 @@ class OpenStackInterface:
         # Read the VM setup script file as a bytes object
         self.vm_setup_script = None
         if self.vm_setup_script_path is not None:
+            logger.debug(f"Loading VM setup script from: {vm_setup_script_path}")
             with open(self.vm_setup_script_path, 'r') as f:
                 self.vm_setup_script = f.read()
 
         # set the external network ID
         self.external_network_id = external_network_id
+        logger.debug(f"External network ID: {external_network_id}")
 
         # initialize the OpenStack session
+        logger.info("Initializing OpenStack session")
         self.openstack_session = self.init_openstack_session()
 
         # initialize the OpenStack clients
+        logger.info("Initializing OpenStack clients")
         self.initialize_clients()
 
         # get the list of projects since you have to be admin to list projects
+        logger.debug("Fetching project list")
         self.project_list = self.ks_client.projects.list()
+        logger.info(f"OpenStackInterface initialized with {len(self.project_list)} projects")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -174,12 +185,16 @@ class OpenStackInterface:
 
         # check that the project exists
         if not self.check_project_exists(project_name=project_name):
-            raise ValueError(f"Project with name {project_name} does not exist.")
+            error_msg = f"Project with name {project_name} does not exist."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # after all checks, set the project name in the environment variable
+        logger.info(f"Switching to project: {project_name}")
         self.set_project_name_env_var(project_name)
         self.openstack_session = self.init_openstack_session()
         self.initialize_clients()
+        logger.debug(f"Successfully switched to project: {project_name}")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -192,9 +207,12 @@ class OpenStackInterface:
         body = {"floatingip": {"floating_network_id": self.external_network_id}}
 
         try:
-            return self.neutron_client.create_floatingip(body)['floatingip']
+            logger.debug("Allocating new floating IP")
+            fip = self.neutron_client.create_floatingip(body)['floatingip']
+            logger.info(f"Allocated floating IP: {fip.get('floating_ip_address')}")
+            return fip
         except Exception as e:
-            print(f"Error allocating floating IP: {e}")
+            logger.error(f"Error allocating floating IP: {str(e)}")
             return None
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -207,16 +225,19 @@ class OpenStackInterface:
         # First check if there are any floating IPs allocated to the project
         # if not then try to allocate one
         if self.get_num_allocated_floating_ips() == 0:
-            print("No floating IPs allocated to the project. Allocating one...")
+            logger.info("No floating IPs allocated to the project. Allocating one")
             self._allocate_fip()
 
         floating_ips = self.neutron_client.list_floatingips()['floatingips']
 
         for fip in floating_ips:
             if not fip['port_id']:
+                logger.debug(f"Found available floating IP: {fip['floating_ip_address']}")
                 return fip
 
-        raise ValueError("No available floating IPs found.")
+        error_msg = "No available floating IPs found."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -239,9 +260,11 @@ class OpenStackInterface:
     def _disassociate_fip(self, fip):
 
         try:
+            logger.info(f"Disassociating floating IP: {fip['floating_ip_address']}")
             self.neutron_client.update_floatingip(fip['id'], {"floatingip": {"port_id": None}})
-            print(f"Disassociated Floating IP {fip['floating_ip_address']}")
+            logger.debug(f"Disassociated Floating IP {fip['floating_ip_address']}")
         except Exception as e:
+            logger.error(f"Error disassociating floating IP: {str(e)}")
             raise e
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -249,9 +272,11 @@ class OpenStackInterface:
     def _associate_fip(self, fip, port_id):
 
         try:
+            logger.info(f"Associating floating IP {fip['floating_ip_address']} with port {port_id}")
             self.neutron_client.update_floatingip(fip['id'], {"floatingip": {"port_id": port_id}})
-            print(f"Associated Floating IP {fip['floating_ip_address']} with port ID {port_id}")
+            logger.debug(f"Associated Floating IP {fip['floating_ip_address']} with port ID {port_id}")
         except Exception as e:
+            logger.error(f"Error associating floating IP: {str(e)}")
             raise e
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -261,8 +286,9 @@ class OpenStackInterface:
         Release a floating IP by its ID.
         """
         if fip:
-            print(f"Releasing Floating IP {fip.get('floating_ip_address')}")
+            logger.info(f"Releasing floating IP: {fip.get('floating_ip_address')}")
             self.neutron_client.delete_floatingip(fip.get('id'))
+            logger.debug(f"Floating IP {fip.get('floating_ip_address')} released")
         else:
             raise ValueError("Floating IP data structure must be provided to release the floating IP.")
 
@@ -274,20 +300,21 @@ class OpenStackInterface:
         Disassociate a floating IP from a port.
         """
 
+        logger.info(f"Detaching floating IP from VM: {vm.name}")
         # set the active project to the VM's tenant
         self.change_project(project_id=vm.tenant_id)
 
         # try to get the port ID of the VM
         try:
             port_id = self.get_vm_port_id(vm)
-            print(f"Found port ID for VM {vm.name}: {port_id}")
+            logger.debug(f"Found port ID for VM {vm.name}: {port_id}")
         except ValueError as e:
             raise e
 
         # try to get the floating IP associated with the port
         try:
             fip = self._get_fip_associated_to_port(port_id)
-            print(f"Found Floating IP {fip['floating_ip_address']} associated with port ID {port_id}")
+            logger.debug(f"Found Floating IP {fip['floating_ip_address']} associated with port ID {port_id}")
         except ValueError as e:
             raise e
 
@@ -300,6 +327,7 @@ class OpenStackInterface:
         # release the floating IP so it can be used in another project
         try:
             self._release_fip(fip)
+            logger.info(f"Successfully detached floating IP from VM: {vm.name}")
         except Exception as e:
             raise e
 
@@ -310,25 +338,27 @@ class OpenStackInterface:
         Associate a floating IP to a port.
         """
 
+        logger.info(f"Attaching floating IP to VM: {vm.name}")
         # set the active project to the VM's tenant
         self.change_project(project_id=vm.tenant_id)
 
         # try to get a floating IP
         try:
             fip = self._get_fip()
-            print(f"Found available Floating IP: {fip['floating_ip_address']}")
+            logger.debug(f"Found available Floating IP: {fip['floating_ip_address']}")
         except ValueError as e:
             raise e
 
         # try to get the port ID of the VM
         try:
             port_id = self.get_vm_port_id(vm)
-            print(f"Found port ID for VM {vm.name}: {port_id}")
+            logger.debug(f"Found port ID for VM {vm.name}: {port_id}")
         except ValueError as e:
             raise e
 
         try:
             self._associate_fip(fip, port_id)
+            logger.info(f"Successfully attached floating IP {fip['floating_ip_address']} to VM: {vm.name}")
         except Exception as e:
             raise e
 
@@ -352,12 +382,15 @@ class OpenStackInterface:
         Check if there are any floating IPs available in the ACTIVE PROJECT.
         """
 
+        logger.debug("Checking floating IP availability")
         fip = self._allocate_fip()
 
         if fip:
             # release the allocated floating IP since this is just a check
+            logger.debug("Floating IPs are available")
             return True
         else:
+            logger.warning("No floating IPs available")
             return False
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -380,11 +413,15 @@ class OpenStackInterface:
         if vm_name is None:
             raise ValueError("VM name must be provided to get the VM.")
 
+        logger.debug(f"Looking up VM by name: {vm_name}")
         for server in self.nova_client.servers.list(search_opts={'all_tenants': True}):
             if server.name == vm_name:
+                logger.debug(f"VM found: {vm_name}")
                 return server
 
-        raise ValueError(f"VM with name {vm_name} not found.")
+        error_msg = f"VM with name {vm_name} not found."
+        logger.warning(error_msg)
+        raise ValueError(error_msg)
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -414,12 +451,14 @@ class OpenStackInterface:
         """
         Get the list of images from the Glance client.
         """
+        logger.debug("Fetching OS image list from Glance")
         glance_images = self.glance_client.images.list()
         image_list = []
 
         for image in glance_images:
             image_list.append(image['name'])
 
+        logger.debug(f"Retrieved {len(image_list)} images from Glance")
         return image_list
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -449,6 +488,7 @@ class OpenStackInterface:
     def get_vm_by_floating_ip(self,
                               floating_ip_address : str):
 
+        logger.debug(f"Looking up VM by floating IP: {floating_ip_address}")
         servers = self.nova_client.servers.list(search_opts={'all_tenants': True})
 
         for server in servers:
@@ -456,8 +496,10 @@ class OpenStackInterface:
             for network in addresses.values():
                 for addr in network:
                     if addr.get('OS-EXT-IPS:type') == 'floating' and addr.get('addr') == floating_ip_address:
+                        logger.debug(f"VM found with floating IP {floating_ip_address}: {server.name}")
                         return server
 
+        logger.warning(f"No VM found with floating IP: {floating_ip_address}")
         return None
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -507,10 +549,12 @@ class OpenStackInterface:
                   image,
                   networks : list):
 
+        logger.info(f"Creating VM: hostname={hostname}, project={project_name}, flavor={flavour.name}")
         self.change_project(project_name=project_name)
 
         # create the VM using the Nova client
         try:
+            logger.debug(f"Requesting VM creation from Nova: hostname={hostname}, image={image.name if hasattr(image, 'name') else image}")
             vm = self.nova_client.servers.create(   name=hostname,
                                                     image=image,
                                                     flavor=flavour,
@@ -518,15 +562,29 @@ class OpenStackInterface:
                                                     nics=networks,
                                                     userdata=self.vm_setup_script)
 
-            if vm.status == 'ERROR':
-                raise ValueError(f"Failed to create VM: VM entered ERROR state.")
 
             # wait for the VM to become ACTIVE
             while vm.status != 'ACTIVE':
-                print(f"Waiting for VM {hostname} to become ACTIVE. Current status: {vm.status}")
+                logger.debug(f"Waiting for VM {hostname} to become ACTIVE. Current status: {vm.status}")
                 time.sleep(1)
                 vm = self.nova_client.servers.get(vm.id)
+                if vm.status == 'ERROR':
+                    fault_info = getattr(vm, 'fault', None)
+                    if fault_info:
+                        fault_code = fault_info.get('code', 'Unknown')
+                        fault_message = fault_info.get('message', 'No message available')
+                        fault_details = fault_info.get('details', '')
+                        error_msg = f"Failed to create VM: VM entered ERROR state. Fault code: {fault_code}, Message: {fault_message}"
+                        if fault_details:
+                            logger.error(f"{error_msg}\nDetails: {fault_details}")
+                        else:
+                            logger.error(error_msg)
+                    else:
+                        error_msg = f"Failed to create VM: VM entered ERROR state (no fault details available)."
+                        logger.error(error_msg)
+                    raise ValueError(error_msg)
 
+            logger.info(f"VM {hostname} is now ACTIVE")
             return vm
 
         except novaclient.exceptions.Forbidden as e:
