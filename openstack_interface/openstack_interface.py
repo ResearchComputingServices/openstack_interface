@@ -198,11 +198,35 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def _release_fip(self, fip=None):
+        """
+        Release a floating IP by its ID.
+        """
+        if fip:
+            logger.info(f"Releasing floating IP: {fip.get('floating_ip_address')}")
+            self.neutron_client.delete_floatingip(fip.get('id'))
+            logger.debug(f"Floating IP {fip.get('floating_ip_address')} released")
+        else:
+            raise ValueError("Floating IP data structure must be provided to release the floating IP.")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    def _release_all_down_fips(self):
+        logger.info("Releasing all DOWN floating IPs")
+        floating_ips = self.neutron_client.list_floatingips()['floatingips']
+
+        for fip in floating_ips:
+            if fip['status'] == 'DOWN':
+                self._release_fip(fip)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def _allocate_fip(self):
 
         """
         Allocate a floating IP to the ACTIVE PROJECT.
         """
+
+        self._release_all_down_fips()
 
         body = {"floatingip": {"floating_network_id": self.external_network_id}}
 
