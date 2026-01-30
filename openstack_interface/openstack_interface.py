@@ -390,14 +390,46 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def create_flavor(self, vcpus, ram, disk):
+    def _get_gpu_extra_specs(self, gpu_type):
+        """
+        Get the extra specs for a GPU type.
+        """
+        gpu_extra_specs = { 'a100-80':"aggregate_instance_extra_specs:gpu56='true', pci_passthrough:alias='gpu56:1'",
+                            'a100-40':"aggregate_instance_extra_specs:gpu2='true', pci_passthrough:alias='gpu2:1'",
+                            'v100':"pci_passthrough:alias='gpu:1'",
+                            '1080ti':"pci_passthrough:alias='gtx1080:1'",
+                            'mi210':"aggregate_instance_extra_specs:mi210='true', pci_passthrough:alias='mi210:1'",
+                            'l40s':"pci_passthrough:alias='l40s:1'",
+                            'h200':"pci_passthrough:alias='h200:1'"}
+
+        if gpu_type not in gpu_extra_specs:
+            raise ValueError(f"Unsupported GPU type: {gpu_type}")
+
+        return gpu_extra_specs[gpu_type]
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def create_flavor(self, vcpus, ram, disk, gpu_type=None):
 
         flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
 
-        return  self.nova_client.flavors.create(name=flavour_name,
-                                                ram=ram * 1024,  # MB
-                                                vcpus=vcpus,
-                                                disk=disk)
+        if gpu_type:
+            flavour_name = f"{gpu_type}.{flavour_name}"
+
+        flavour =  self.nova_client.flavors.create( name=flavour_name,
+                                                    ram=ram * 1024,  # MB
+                                                    vcpus=vcpus,
+                                                    disk=disk)
+
+        if gpu_type:
+            try:
+                extra_specs = self._get_gpu_extra_specs(gpu_type)
+                self.nova_client.v2.flavors.set_keys(flavour.id, extra_specs)
+            except ValueError as e:
+                logger.error(f"Error setting extra specs for GPU type {gpu_type}: {e}")
+                raise e
+
+        return flavour
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
