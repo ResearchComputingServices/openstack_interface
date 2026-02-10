@@ -51,8 +51,8 @@ class OpenStackInterface:
 
     def __init__(self,
                  vm_setup_script_path : str = None,
-                 external_network_id : str = 'bb005c60-fb45-481a-97fb-f746033e1c5d',
-                 key_name : str = 'newmaster'):
+                 external_network_id : str = None,
+                 key_name : str = None):
 
         logger.info("Initializing OpenStackInterface")
         # TODO: add error checking for the script paths
