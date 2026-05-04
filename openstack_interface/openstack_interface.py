@@ -652,7 +652,7 @@ class OpenStackInterface:
             return vm
 
         except novaclient.exceptions.Forbidden as e:
-            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self._get_creds()}': {e}")
+            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self.get_creds()}': {e}")
 
         except Exception as e:
             raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
