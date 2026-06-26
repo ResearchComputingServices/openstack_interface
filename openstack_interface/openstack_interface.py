@@ -54,6 +54,12 @@ class OpenStackInterface:
                  external_network_id : str = None,
                  key_name : str = None):
 
+        # check that the required environment variables are set before initializing the OpenStack session
+        try:
+            self._check_required_env_vars()
+        except ValueError as e:
+            raise e
+
         logger.info("Initializing OpenStackInterface")
         # TODO: add error checking for the script paths
         self.vm_setup_script_path = vm_setup_script_path
@@ -84,6 +90,13 @@ class OpenStackInterface:
         logger.info(f"OpenStackInterface initialized with {len(self.project_list)} projects")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _check_required_env_vars(self):
+        missing_vars = [var for var in NOVA_CREDS_ENV_VARS if var not in os.environ]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def set_project_name_env_var(self, project_name: str):
 
@@ -357,10 +370,17 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def attach_fip_to_vm(self, vm):
+    def attach_fip_to_vm(self, vm_id):
         """
         Associate a floating IP to a port.
         """
+
+        self.change_project(project_id=self.nova_client.servers.get(vm_id).tenant_id)
+
+        try:
+            vm = self.nova_client.servers.get(vm_id)
+        except Exception as e:
+            raise ValueError(f"Failed to retrieve VM with ID {vm_id}")
 
         logger.info(f"Attaching floating IP to VM: {vm.name}")
         # set the active project to the VM's tenant
@@ -412,6 +432,43 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def get_flavor(self,
+                   vcpus : int,
+                   ram : int,
+                   disk : int,
+                   gpu_type : str = None,
+                   gpu_count : int = 0):
+
+        """
+        Get a flavor that matches the requested specifications, or create one if it doesn't exist.
+        """
+
+        # generate the flavor name based on the specifications
+        flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
+
+        if gpu_type and gpu_count > 0:
+            flavour_name = f"{gpu_type}.{flavour_name}"
+
+        # check if a flavor with the same name already exists
+        for flavor in self.nova_client.flavors.list():
+            if flavor.name == flavour_name:
+                return flavor
+
+        return self.create_flavor(  vcpus=vcpus,
+                                    ram=ram,
+                                    disk=disk,
+                                    gpu_type=gpu_type)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def get_flavor_list(self):
+        """
+        Get the list of flavors from the Nova client.
+        """
+        return self.nova_client.flavors.list()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def create_flavor(self, vcpus, ram, disk, gpu_type=None):
 
         flavour_name = f"{vcpus}cpu{ram}gb.{disk}g"
@@ -431,7 +488,6 @@ class OpenStackInterface:
         if gpu_type:
             try:
                 extra_specs = self._get_gpu_extra_specs(gpu_type)
-                print(extra_specs)
                 flavour.set_keys(extra_specs)
             except ValueError as e:
                 logger.error(f"Error setting extra specs for GPU type {gpu_type}: {e}")
@@ -454,7 +510,7 @@ class OpenStackInterface:
             logger.debug("Floating IPs are available")
             return True
         else:
-            logger.warning("No floating IPs available")
+            logger.warning(f"No floating IPs available for project {self.get_project_name_env_var()}")
             return False
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -487,6 +543,18 @@ class OpenStackInterface:
         logger.warning(error_msg)
         raise ValueError(error_msg)
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def check_vm_exists(self, vm_id=None):
+        """
+        Check if a VM exists by its ID.
+        """
+        try:
+            self.nova_client.servers.get(vm_id)
+            return True
+        except novaclient.exceptions.NotFound:
+            return False
+
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_vm_port_id(self, vm):
@@ -501,6 +569,27 @@ class OpenStackInterface:
 
         return port_id
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    def check_vm_fip(self, vm_id):
+        """
+        Check if a VM has a floating IP assigned.
+        """
+        try:
+            vm = self.nova_client.servers.get(vm_id)
+        except Exception as e:
+            raise ValueError(f"Failed to retrieve VM with ID {vm_id}")
+
+        logger.debug(f"Checking if VM {vm.name} has a floating IP assigned")
+        server_interfaces = self.nova_client.servers.interface_list(vm.id)
+        for interface in server_interfaces:
+            port_id = interface.port_id
+            floating_ips = self.neutron_client.list_floatingips(port_id=port_id)['floatingips']
+            if floating_ips:
+                logger.debug(f"VM {vm.name} has a floating IP assigned: {floating_ips[0]['floating_ip_address']}")
+                return True
+
+        logger.debug(f"VM {vm.name} does not have a floating IP assigned")
+        return False
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     def get_projects(self):
@@ -566,13 +655,7 @@ class OpenStackInterface:
         logger.warning(f"No VM found with floating IP: {floating_ip_address}")
         return None
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def get_flavor_list(self):
-        """
-        Get the list of flavors from the Nova client.
-        """
-        return self.nova_client.flavors.list()
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -649,7 +732,10 @@ class OpenStackInterface:
                     raise ValueError(error_msg)
 
             logger.info(f"VM {hostname} is now ACTIVE")
-            return vm
+
+            return {'vm_id': vm.id,
+                    'hostname': hostname,
+                    'server_hostname': self.get_vm_hypervisor_name(vm.id),}
 
         except novaclient.exceptions.Forbidden as e:
             raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self.get_creds()}': {e}")
