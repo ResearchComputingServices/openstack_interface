@@ -689,6 +689,31 @@ class OpenStackInterface:
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    def _get_validated_key_name(self):
+        """
+        Validate the configured keypair in the current project scope.
+        """
+        if self.key_name is None:
+            return None
+
+        key_name = self.key_name.strip() if isinstance(self.key_name, str) else self.key_name
+        if not key_name:
+            raise ValueError("Invalid key_name: key_name is empty.")
+
+        try:
+            self.nova_client.keypairs.get(key_name)
+            return key_name
+        except novaclient.exceptions.NotFound:
+            available_keypairs = [kp.name for kp in self.nova_client.keypairs.list()]
+            raise ValueError(
+                f"Invalid key_name '{key_name}' for project '{self.get_project_name_env_var()}'. "
+                f"Available keypairs: {available_keypairs if available_keypairs else 'none'}"
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to validate key_name '{key_name}': {type(e).__name__}:{e}")
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
     def create_vm(self,
                   project_name : str,
                   hostname : str,
@@ -697,18 +722,21 @@ class OpenStackInterface:
                   networks : list):
 
         logger.info(f"Creating VM: hostname={hostname}, project={project_name}, flavor={flavour.name}")
-        self.change_project(project_name=project_name)
+        try:
+            self.change_project(project_name=project_name)
+        except Exception as e:
+            raise ValueError(f"Failed to change project to {project_name}: {e}")
 
         # create the VM using the Nova client
         try:
+            validated_key_name = self._get_validated_key_name()
             logger.debug(f"Requesting VM creation from Nova: hostname={hostname}, image={image.name if hasattr(image, 'name') else image}")
             vm = self.nova_client.servers.create(   name=hostname,
                                                     image=image,
                                                     flavor=flavour,
-                                                    key_name=self.key_name,
+                                                    key_name=validated_key_name,
                                                     nics=networks,
                                                     userdata=self.vm_setup_script)
-
 
             # wait for the VM to become ACTIVE
             while vm.status != 'ACTIVE':
@@ -731,17 +759,17 @@ class OpenStackInterface:
                         logger.error(error_msg)
                     raise ValueError(error_msg)
 
-            logger.info(f"VM {hostname} is now ACTIVE")
+            # logger.info(f"VM {hostname} is now ACTIVE")
 
             return {'vm_id': vm.id,
                     'hostname': hostname,
                     'server_hostname': self.get_vm_hypervisor_name(vm.id),}
 
         except novaclient.exceptions.Forbidden as e:
-            raise ValueError(f"Failed to create VM: Permission denied to create VM in project '{self.get_creds()}': {e}")
+            raise ValueError(f"Permission denied to create VM in project '{self.get_creds()}': {e}")
 
         except Exception as e:
-            raise ValueError(f"Failed to create VM:{type(e).__name__}:{e}")
+            raise ValueError(f"Other Exception: {type(e).__name__}:{e}")
 
 
 # =================================================================================================
